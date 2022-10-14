@@ -23,6 +23,11 @@
 !setup.cfg
 !cfg/yolov3*.cfg
 
+pretrained_weights/
+*.out
+fortest.py
+exp.sh
+
 storage.googleapis.com
 runs/*
 data/*

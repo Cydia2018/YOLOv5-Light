@@ -140,7 +140,7 @@ class BaseModel(nn.Module):
     def fuse(self):  # fuse model Conv2d() + BatchNorm2d() layers
         LOGGER.info('Fusing layers... ')
         for m in self.model.modules():
-            if isinstance(m, (Conv, DWConv)) and hasattr(m, 'bn'):
+            if isinstance(m, (Conv, DWConv, SlimConv)) and hasattr(m, 'bn'):
                 m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
                 delattr(m, 'bn')  # remove batchnorm
                 m.forward = m.forward_fuse  # update forward
@@ -298,7 +298,7 @@ class ClassificationModel(BaseModel):
 
 def parse_model(d, ch):  # model_dict, input_channels(3)
     # Parse a YOLOv5 model.yaml dictionary
-    LOGGER.info(f"\n{'':>3}{'from':>18}{'n':>3}{'params':>10}  {'module':<40}{'arguments':<30}")
+    # LOGGER.info(f"\n{'':>3}{'from':>18}{'n':>3}{'params':>10}  {'module':<40}{'arguments':<30}")
     anchors, nc, gd, gw, act = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple'], d.get('activation')
     if act:
         Conv.default_act = eval(act)  # redefine default activation, i.e. Conv.default_act = nn.SiLU()
@@ -316,15 +316,30 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         n = n_ = max(round(n * gd), 1) if n > 1 else n  # depth gain
         if m in {
                 Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, MixConv2d, Focus, CrossConv,
-                BottleneckCSP, C3, C3TR, C3SPP, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x}:
+                BottleneckCSP, C3, C3TR, C3SPP, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x,
+                ConvNeXt_Stem, ConvNeXt_Block, ConvNeXt_Downsample}:
             c1, c2 = ch[f], args[0]
             if c2 != no:  # if not output
                 c2 = make_divisible(c2 * gw, 8)
 
             args = [c1, c2, *args[1:]]
-            if m in {BottleneckCSP, C3, C3TR, C3Ghost, C3x}:
+            if m in {BottleneckCSP, C3, C3TR, C3Ghost, C3x, ConvNeXt_Block}:
                 args.insert(2, n)  # number of repeats
                 n = 1
+        elif m in {SlimConv, SlimSPPF}:
+            c1, c2 = ch[f], args[0]
+            ratio = args[1]
+            if c2 != no:  # if not output
+                c2 = max(make_divisible(c2 * gw * ratio, 8), 8)
+            args = [c1, c2, *args[2:]]
+        elif m is SlimC3:
+            c1, c2 = ch[f], args[0]
+            ratio = args[1]
+            if c2 != no:  # if not output
+                c2 = max(make_divisible(c2 * gw * ratio, 8), 8)
+            args = [c1, c2, *args[2:]]
+            args.insert(2, n)  # number of repeats
+            n = 1
         elif m is nn.BatchNorm2d:
             args = [ch[f]]
         elif m is Concat:
@@ -347,7 +362,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         t = str(m)[8:-2].replace('__main__.', '')  # module type
         np = sum(x.numel() for x in m_.parameters())  # number params
         m_.i, m_.f, m_.type, m_.np = i, f, t, np  # attach index, 'from' index, type, number params
-        LOGGER.info(f'{i:>3}{str(f):>18}{n_:>3}{np:10.0f}  {t:<40}{str(args):<30}')  # print
+        # LOGGER.info(f'{i:>3}{str(f):>18}{n_:>3}{np:10.0f}  {t:<40}{str(args):<30}')  # print
         save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
         layers.append(m_)
         if i == 0:

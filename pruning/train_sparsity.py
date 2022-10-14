@@ -2,14 +2,11 @@
 """
 Train a YOLOv5 model on a custom dataset.
 Models and datasets download automatically from the latest YOLOv5 release.
-
 Usage - Single-GPU training:
     $ python train.py --data coco128.yaml --weights yolov5s.pt --img 640  # from pretrained (recommended)
     $ python train.py --data coco128.yaml --weights '' --cfg yolov5s.yaml --img 640  # from scratch
-
 Usage - Multi-GPU DDP training:
     $ python -m torch.distributed.run --nproc_per_node 4 --master_port 1 train.py --data coco128.yaml --weights yolov5s.pt --img 640 --device 0,1,2,3
-
 Models:     https://github.com/ultralytics/yolov5/tree/master/models
 Datasets:   https://github.com/ultralytics/yolov5/tree/master/data
 Tutorial:   https://github.com/ultralytics/yolov5/wiki/Train-Custom-Data
@@ -19,6 +16,7 @@ import argparse
 import math
 import os
 import random
+from statistics import mode
 import sys
 import time
 from copy import deepcopy
@@ -26,15 +24,20 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+from parso import parse
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import yaml
 from torch.optim import lr_scheduler
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))  # add ROOT to PATH
+ROOT = ROOT.parent
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
@@ -57,7 +60,7 @@ from utils.loggers.wandb.wandb_utils import check_wandb_resume
 from utils.loss import ComputeLoss
 from utils.metrics import fitness
 from utils.plots import plot_evolve
-from utils.convert_const import *
+from utils.prune_utils import parse_module_defs, obtain_quantiles, gather_bnweights
 from utils.torch_utils import (EarlyStopping, ModelEMA, de_parallel, select_device, smart_DDP, smart_optimizer,
                                smart_resume, torch_distributed_zero_first)
 
@@ -115,7 +118,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     is_coco = isinstance(val_path, str) and val_path.endswith('coco/val2017.txt')  # COCO dataset
 
     # Model
-    check_suffix(weights, ('.pt', '.pth'))  # check weights
+    check_suffix(weights, '.pt')  # check weights
     pretrained = weights.endswith('.pt')
     if pretrained:
         with torch_distributed_zero_first(LOCAL_RANK):
@@ -129,27 +132,15 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         LOGGER.info(f'Transferred {len(csd)}/{len(model.state_dict())} items from {weights}')  # report
     else:
         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
-        conv_ckpt = torch.load(weights)['model']
-        ckpt = model.state_dict()
-        new_ckpt = {}
-        for k,v in conv_ckpt.items():
-            if k in convnext2yolo:
-                new_ckpt[convnext2yolo[k]] = v
-            elif k=='norm.weight' or k=='norm.bias' or 'head' in k:
-                pass
-            elif 'stages.0' in k:
-                new_ckpt[k.replace('stages.0', 'model.1.m')] = v
-            elif 'stages.1' in k:
-                new_ckpt[k.replace('stages.1', 'model.3.m')] = v
-            elif 'stages.2' in k:
-                new_ckpt[k.replace('stages.2', 'model.5.m')] = v
-            elif 'stages.3' in k:
-                new_ckpt[k.replace('stages.3', 'model.7.m')] = v
-        ckpt.update(new_ckpt)
-        model.load_state_dict(ckpt)
-        print('load ConvNeXt pretrain weights successfully................')
+    amp = check_amp(model) if not opt.st else False  # check AMP
 
-    amp = check_amp(model)  # check AMP
+    if opt.st:
+        ignore_idx, _, _ = parse_module_defs(model.yaml)
+        # bnw = gather_bnweights(model, ignore_idx).numpy()
+        # np.save('bnw.npy', bnw)
+        # plt.hist(bnw, bins=100)
+        # plt.savefig('x.png')
+        # raise NotImplementedError
 
     # Freeze
     freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
@@ -333,18 +324,37 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     loss *= 4.
 
             # Backward
-            scaler.scale(loss).backward()
+            if not opt.st:
+                scaler.scale(loss).backward()
+                # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
+                if ni - last_opt_step >= accumulate:
+                    scaler.unscale_(optimizer)  # unscale gradients
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)  # clip gradients
+                    scaler.step(optimizer)  # optimizer.step
+                    scaler.update()
+                    optimizer.zero_grad()
+                    if ema:
+                        ema.update(model)
+                    last_opt_step = ni
+                # raise NotImplementedError
 
-            # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
-            if ni - last_opt_step >= accumulate:
-                scaler.unscale_(optimizer)  # unscale gradients
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)  # clip gradients
-                scaler.step(optimizer)  # optimizer.step
-                scaler.update()
-                optimizer.zero_grad()
-                if ema:
-                    ema.update(model)
-                last_opt_step = ni
+            # Backward + Sparsity
+            else:
+                loss.backward()
+                sr = opt.sr * (1 - 0.9 * epoch / epochs)        # ↓
+                # sr = opt.sr * (0.1 + 0.9 * epoch / epochs)      # ↑
+                # sr = opt.sr if epoch < 0.5*epochs else opt.sr*0.1
+                for n, m in model.named_modules():
+                    if isinstance(m, nn.BatchNorm2d) and (n not in ignore_idx):
+                        m.weight.grad.data.add_(sr * torch.sign(m.weight.data))  # L1
+                if ni - last_opt_step >= accumulate:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)  # clip gradients
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    if ema:
+                        ema.update(model)
+                    last_opt_step = ni
+            
 
             # Log
             if RANK in {-1, 0}:
@@ -360,6 +370,24 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         # Scheduler
         lr = [x['lr'] for x in optimizer.param_groups]  # for loggers
         scheduler.step()
+
+        if opt.st:
+            size_list = []
+            weights_list = []
+            for n, m in model.named_modules():
+                if isinstance(m, nn.BatchNorm2d) and (n not in ignore_idx):
+                    size_list.append(m.weight.data.size(0))
+                    weights_list.append(m.weight.data.abs().clone())
+            
+            bn_weights = torch.zeros(sum(size_list))
+            idx = 0
+            for w, size in zip(weights_list, size_list):
+                bn_weights[idx:(idx + size)] = w
+                idx += size
+            
+            if epoch > 30:
+                loggers.tb.add_histogram('bn_weights/hist', bn_weights.numpy(), epoch, bins='doane')
+            obtain_quantiles(bn_weights, num_quantile=10)
 
         if RANK in {-1, 0}:
             # mAP
@@ -456,6 +484,8 @@ def parse_opt(known=False):
     parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
     parser.add_argument('--data', type=str, default=ROOT / 'data/coco128.yaml', help='dataset.yaml path')
     parser.add_argument('--hyp', type=str, default=ROOT / 'data/hyps/hyp.scratch-low.yaml', help='hyperparameters path')
+    parser.add_argument('--st', action='store_true', help='channel-wise sparse training')
+    parser.add_argument('--sr', type=float, default=0.001, help='channel-wise sparse training ratio')
     parser.add_argument('--epochs', type=int, default=300, help='total training epochs')
     parser.add_argument('--batch-size', type=int, default=16, help='total batch size for all GPUs, -1 for autobatch')
     parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=640, help='train, val image size (pixels)')
@@ -628,7 +658,9 @@ def main(opt, callbacks=Callbacks()):
             results = train(hyp.copy(), opt, device, callbacks)
             callbacks = Callbacks()
             # Write mutation results
-            print_mutation(results, hyp.copy(), save_dir, opt.bucket)
+            keys = ('metrics/precision', 'metrics/recall', 'metrics/mAP_0.5', 'metrics/mAP_0.5:0.95', 'val/box_loss',
+                    'val/obj_loss', 'val/cls_loss')
+            print_mutation(keys, results, hyp.copy(), save_dir, opt.bucket)
 
         # Plot results
         plot_evolve(evolve_csv)
